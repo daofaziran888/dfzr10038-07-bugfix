@@ -314,6 +314,121 @@ def flow_lineage_to_version_to_mon(feature_line_id: int) -> list[FlowEffect]:
 
 
 # ============================ 链路6: 版本管理→在线服务 ============================
+#
+# 版本侧(version_mgr)是特征绑定的唯一事实来源，端侧(online_serv)只保存
+# 当前有效绑定的投影：
+#   - 端点 version_bindings：{关联特征: {版本编号, 版本标签, tag}}，每特征至多一个生效版本；
+#   - 端点 特征列表：普通特征 token + 有效绑定标签，已撤销/被替换的标签一律剔除；
+#   - 端点 当前生效版本：值班员据此判断端点是否已换版、能否开始下一次切换；
+#   - 版本 生效端点 / 操作记录：切换与回滚各自的结果都能从版本侧回查。
+
+
+def _version_tag(version_row: dict[str, Any]) -> str:
+    """版本在端点特征列表中的标签 token。"""
+    return f"v{version_row.get('版本标签', '')}"
+
+
+def _known_version_tags() -> set[str]:
+    """所有版本行产生过的标签，用于识别特征列表里的版本标签 token。"""
+    return {
+        _version_tag(row)
+        for row in store.rows("version_mgr")
+        if str(row.get("版本标签", "")).strip()
+    }
+
+
+def _endpoint_bindings(orow: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """端点上每个特征当前绑定的生效版本：{关联特征: {版本编号, 版本标签, tag}}。"""
+    bindings = orow.get("version_bindings")
+    if not isinstance(bindings, dict):
+        bindings = {}
+        orow["version_bindings"] = bindings
+    return bindings
+
+
+def _resolve_effective_version(feature: str) -> dict[str, Any] | None:
+    """同一特征当前应生效的版本：仍处于全量生效且最近切换的一条。
+
+    回滚 B 时用它找回 A；已回滚的版本永远不会被选中，
+    因此热加载失败后重试也不会把已撤销的标签重新挂回端点。
+    """
+    candidates = [
+        row for row in store.rows("version_mgr")
+        if str(row.get("关联特征", "")) == feature and row.get("status") == "全量生效"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda row: (str(row.get("last_full_switch_at", "")), int(row.get("id", 0))),
+    )
+
+
+def _rewrite_feature_list(orow: dict[str, Any]) -> bool:
+    """按当前有效绑定重建端点对外可读的特征清单。
+
+    - 普通特征 token 原样保留（兼容未涉及版本流转的历史绑定）；
+    - 仍是有效绑定的版本标签保留，且同一标签不重复出现；
+    - 已撤销或已被替换的版本标签一律剔除。
+    """
+    tokens = [t for t in str(orow.get("特征列表", "")).split(",") if t.strip()]
+    known_tags = _known_version_tags()
+    base = [t for t in tokens if t not in known_tags]
+    tags: list[str] = []
+    for binding in _endpoint_bindings(orow).values():
+        tag = str(binding.get("tag", ""))
+        if tag and tag not in tags:
+            tags.append(tag)
+    new_list = ",".join(base + tags)
+    changed = new_list != str(orow.get("特征列表", ""))
+    orow["特征列表"] = new_list
+    return changed
+
+
+def _refresh_endpoint_version_view(orow: dict[str, Any]) -> None:
+    """把端点实际生效的版本写到在线清单，值班员据此判断能否开始下一次切换。"""
+    bindings = _endpoint_bindings(orow)
+    orow["当前生效版本"] = (
+        ";".join(
+            f"{feat}={binding.get('版本编号', '')}({binding.get('tag', '')})"
+            for feat, binding in bindings.items()
+        )
+        if bindings else "无"
+    )
+
+
+def _sync_version_endpoint_index(feature: str) -> None:
+    """以端点绑定为唯一事实，回写同特征各版本当前生效的端点清单。
+
+    切换和回滚并发时，版本侧与端点侧据此收敛到同一份相符的端点清单。
+    """
+    for vrow in store.rows("version_mgr"):
+        if str(vrow.get("关联特征", "")) != feature:
+            continue
+        ver_no = str(vrow.get("版本编号", ""))
+        vrow["生效端点"] = [
+            str(orow.get("端点编号", ""))
+            for orow in store.rows("online_serv")
+            if _endpoint_bindings(orow).get(feature, {}).get("版本编号") == ver_no
+        ]
+
+
+def _record_version_receipt(
+    vrow: dict[str, Any], action: str, affected: list[dict[str, Any]], note: str,
+) -> None:
+    """在版本侧追加操作回执，切换/回滚各自的结果都能从版本侧回查。
+
+    幂等重试或 flow-trace 预览没有实际影响端点时，不重复登记空回执。
+    """
+    receipts = vrow.setdefault("操作记录", [])
+    if not affected and any(r.get("动作") == action for r in receipts):
+        return
+    receipts.append({
+        "动作": action,
+        "影响端点": [str(o.get("端点编号", "")) for o in affected],
+        "结果": note,
+        "时间": datetime.datetime.now().isoformat(),
+    })
 
 
 @_register(
@@ -323,31 +438,44 @@ def flow_lineage_to_version_to_mon(feature_line_id: int) -> list[FlowEffect]:
 def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     vm = store.find("version_mgr", version_mgr_id)
+    # 已回滚（或尚未全量）的版本不参与热加载：
+    # 热加载失败后重试也不会把已撤销的标签重新挂回端点。
     if vm is None or vm.get("status") != "全量生效":
         return effects
 
     ver_no = str(vm.get("版本编号", ""))
     feat = str(vm.get("关联特征", ""))
     ver_label = str(vm.get("版本标签", ""))
+    tag = _version_tag(vm)
+    now = datetime.datetime.now().isoformat()
+    vm["版本状态"] = "全量生效"
 
-    # 触发在线服务热加载
+    # 触发在线服务热加载：同特征旧版本标签被替换，其它特征的历史绑定保持不变
     online_rows = store.rows("online_serv")
-    updated = False
-    for orow in online_rows:
-        if orow.get("status") == "运行中":
-            orig_features = str(orow.get("特征列表", ""))
-            orow["特征列表"] = f"{orig_features},v{ver_label}"
-            orow["热加载"] = f"已重载({ver_no})"
-            orow["last_version_switch"] = datetime.datetime.now().isoformat()
-            orow["triggered_by"] = f"version_mgr/{ver_no}"
-            effects.append(FlowEffect(
-                "热加载服务", "online_serv", int(orow.get("id", 0)),
-                f"版本 {ver_no}({ver_label}) 全量切换后热加载在线服务 {orow.get('端点编号','')}",
-            ))
-            updated = True
-            break
+    affected: list[dict[str, Any]] = []
+    running = [orow for orow in online_rows if orow.get("status") == "运行中"]
+    for orow in running:
+        bindings = _endpoint_bindings(orow)
+        previous = bindings.get(feat)
+        new_binding = {"版本编号": ver_no, "版本标签": ver_label, "tag": tag}
+        changed = previous != new_binding
+        bindings[feat] = new_binding
+        changed = _rewrite_feature_list(orow) or changed
+        if not changed:
+            continue  # 幂等：该端点已是目标绑定，重试不重复挂标签
+        _refresh_endpoint_version_view(orow)
+        orow["热加载"] = f"已重载({ver_no})"
+        orow["last_version_switch"] = now
+        orow["triggered_by"] = f"version_mgr/{ver_no}"
+        prev_desc = f"，替换 {previous.get('版本编号','')}" if previous else ""
+        effects.append(FlowEffect(
+            "热加载服务", "online_serv", int(orow.get("id", 0)),
+            f"版本 {ver_no}({ver_label}) 全量切换后热加载在线服务 "
+            f"{orow.get('端点编号','')}{prev_desc}，当前生效 {ver_no}({tag})",
+        ))
+        affected.append(orow)
 
-    if not updated:
+    if not running:
         # 如果无运行中端点则部署新端点
         for orow in online_rows:
             if orow.get("status") == "待部署":
@@ -356,13 +484,91 @@ def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
                 orow["热加载"] = "已开启"
                 orow["运行状态"] = "SERVING"
                 orow["特征列表"] = feat
+                _endpoint_bindings(orow)[feat] = {
+                    "版本编号": ver_no, "版本标签": ver_label, "tag": tag,
+                }
+                _rewrite_feature_list(orow)
+                _refresh_endpoint_version_view(orow)
                 orow["triggered_by"] = f"version_mgr/{ver_no}"
                 effects.append(FlowEffect(
                     "部署服务", "online_serv", int(orow.get("id", 0)),
-                    f"版本 {ver_no} 全量切换后部署在线服务 {orow.get('端点编号','')}",
+                    f"版本 {ver_no} 全量切换后部署在线服务 "
+                    f"{orow.get('端点编号','')}，当前生效 {ver_no}({tag})",
                 ))
+                affected.append(orow)
                 break
 
+    if affected or not vm.get("last_full_switch_at"):
+        vm["last_full_switch_at"] = now
+    _sync_version_endpoint_index(feat)
+    note = (
+        f"当前生效版本 {ver_no}({tag})" if affected
+        else "无运行中或待部署端点可热加载"
+    )
+    _record_version_receipt(vm, "全量切换", affected, note)
+    return effects
+
+
+@_register(
+    "version_mgr/回滚版本 → online_serv/热加载回滚(撤销标签)",
+    desc="版本回滚后在线服务按版本侧结果撤销标签，端点特征明细恢复到有效绑定。",
+)
+def flow_version_rollback_to_online(version_mgr_id: int) -> list[FlowEffect]:
+    effects: list[FlowEffect] = []
+    vm = store.find("version_mgr", version_mgr_id)
+    if vm is None or vm.get("status") != "已回滚":
+        return effects
+
+    ver_no = str(vm.get("版本编号", ""))
+    feat = str(vm.get("关联特征", ""))
+    ver_label = str(vm.get("版本标签", ""))
+    tag = _version_tag(vm)
+    now = datetime.datetime.now().isoformat()
+    vm["版本状态"] = "已回滚"
+
+    # 回滚确认后在线查询只能看到有效绑定：同特征若仍有全量生效的旧版本则回挂，
+    # 否则该特征在端点上不再绑定任何版本。
+    successor = _resolve_effective_version(feat)
+    successor_desc = (
+        f"{successor.get('版本编号', '')}({_version_tag(successor)})"
+        if successor else "无"
+    )
+
+    affected: list[dict[str, Any]] = []
+    for orow in store.rows("online_serv"):
+        bindings = _endpoint_bindings(orow)
+        bound = bindings.get(feat)
+        tag_present = tag in str(orow.get("特征列表", "")).split(",")
+        involved = (bound is not None and bound.get("版本编号") == ver_no) or tag_present
+        if not involved:
+            continue  # 未涉及本次回滚的端点与特征保持原样
+        if bound is not None and bound.get("版本编号") == ver_no:
+            if successor is not None:
+                bindings[feat] = {
+                    "版本编号": str(successor.get("版本编号", "")),
+                    "版本标签": str(successor.get("版本标签", "")),
+                    "tag": _version_tag(successor),
+                }
+            else:
+                bindings.pop(feat, None)
+        _rewrite_feature_list(orow)  # 已撤销标签随重建剔除，历史有效绑定保留
+        _refresh_endpoint_version_view(orow)
+        orow["热加载"] = f"已回滚({ver_no})"
+        orow["last_version_rollback"] = now
+        orow["triggered_by"] = f"version_mgr/{ver_no}"
+        effects.append(FlowEffect(
+            "回滚热加载", "online_serv", int(orow.get("id", 0)),
+            f"版本 {ver_no}({ver_label}) 回滚后撤销在线服务 "
+            f"{orow.get('端点编号','')} 的标签 {tag}，当前生效版本 {successor_desc}",
+        ))
+        affected.append(orow)
+
+    _sync_version_endpoint_index(feat)
+    note = (
+        f"已撤销标签 {tag}，端点当前生效版本 {successor_desc}" if affected
+        else "无在线端点绑定该版本，无需热加载回滚"
+    )
+    _record_version_receipt(vm, "回滚版本", affected, note)
     return effects
 
 
